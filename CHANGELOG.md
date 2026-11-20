@@ -7,6 +7,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — Registry upgrade tooling and attestation preflight ([#584](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/584))
+
+- Added `scripts/upgrade-registry.ts` and `pnpm upgrade:registry` to simulate and submit on-chain registry wasm upgrades (`upgrade(new_wasm_hash)`). Simulates by default on testnet and strictly refuses `public`/`mainnet` without `--allow-mainnet`.
+- Added `scripts/preflight-registry.ts` and `pnpm preflight:registry` to verify deployed contract capability against `PROBE_NAMES` before anchor sweep submission.
+- Added preflight step to `.github/workflows/attest-anchors.yml` to fail fast with an actionable error if the registry contract is behind `main`.
+- Documented runbook and contract upgrade procedures in `docs/operations.md`.
+
+### Added — Stellar DEX trade rate collection ([#591](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/591))
+
+- Added `packages/engine/src/rate-collector-dex.ts` to collect Horizon 15-minute resolution trade aggregations (`900000` ms) for configured pairs.
+- Configured default corridor pairs in `config/dex-pairs.json`.
+- Stores close price as exact decimal string and trade count in detail; skips empty buckets with 0 trades.
+- Tags every sample with `source="dex_trade"` for persistence into `PostgresRateHistoryStore`.
+
+### Added — Windowed rate percentile estimation and property tests ([#597](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/597))
+
+- Added `percentile()`, `computeP25()`, `computeMedian()`, `windowed()`, and `estimateRate()` in `packages/engine/src/rate-percentile.ts`.
+- Pure decimal string arithmetic using scaled BigInt fixed-point math to prevent float drift.
+- Verified mathematical properties via property tests: min/max bounds, monotonicity in `p`, order-independence, and absence of floating-point artifacts.
+
+### Added — Engine pre-fetched quote support ([#622](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/622))
+
+- Added `quote?: Quote` to `ExecuteOptions` in `packages/engine/src/run.ts`.
+- When provided, `execute()` skips the quote provider step, logs `corridor.quote.supplied`, and records `quoteSupplied: true` in the audit entry for `advance("quoted")`.
+
 ### Added — Rate history schema and migrations ([#589](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/589))
 
 - Postgres schema and migrations for rate samples written by collector jobs and read by the planner.

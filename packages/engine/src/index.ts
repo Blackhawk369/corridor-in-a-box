@@ -54,6 +54,32 @@ export {
   type ListRateSamplesFilter,
 } from "./rate-samples-pg";
 export {
+  percentile,
+  computeP25,
+  computeMedian,
+  windowed,
+  estimateRate,
+  type EstimateRateOptions,
+} from "./rate-percentile";
+export {
+  DEX_TRADE_RESOLUTION_15M,
+  formatDexAsset,
+  resolveAssetQueryParams,
+  defaultHorizonUrl,
+  buildTradeAggregationsUrl,
+  transformTradeAggregations,
+  fetchTradeAggregations,
+  collectDexTradesForPair,
+  collectDexTrades,
+  loadDexPairsConfig,
+  type DexAssetConfig,
+  type DexPairConfig,
+  type HorizonTradeAggregationRecord,
+  type HorizonTradeAggregationsResponse,
+  type CollectDexTradesOptions,
+  type RateSampleSink,
+} from "./rate-collector-dex";
+export {
   UnimplementedSubmitter,
   createMockSubmitter,
   StellarPaymentStrategy,
