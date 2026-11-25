@@ -65,6 +65,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   and is never re-quoted.
 - The transition into `quoted` records `quoteSupplied: true` in the audit trail, and the run
   logs `corridor.quote.supplied`.
+
 ### Added — live testnet failure scenarios against the reference anchor ([#673](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/673), [#674](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/674), [#675](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/675), [#676](https://github.com/corridor-in-a-box/corridor-in-a-box/issues/676))
 
 - `.github/workflows/reference-live-scenarios.yml` runs, daily and on demand,
