@@ -140,13 +140,20 @@ export function assertDexPair(pair: DexPairConfig): void {
   }
 }
 
+/** Drop trailing slashes without a regex (a `/\/+$/` on caller input can backtrack). */
+function trimTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 47) end -= 1;
+  return url.slice(0, end);
+}
+
 /** The `/trade_aggregations` URL for one pair. */
 export function buildTradeAggregationsUrl(
   pair: DexPairConfig,
   options: CollectDexTradesOptions = {},
 ): string {
   assertDexPair(pair);
-  const base = (options.horizonUrl ?? defaultHorizonUrl(pair.network)).replace(/\/+$/, "");
+  const base = trimTrailingSlashes(options.horizonUrl ?? defaultHorizonUrl(pair.network));
   const url = new URL(`${base}/trade_aggregations`);
   for (const [k, v] of Object.entries({
     ...horizonAssetParams(pair.base, "base"),
