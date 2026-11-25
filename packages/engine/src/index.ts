@@ -40,6 +40,7 @@ export {
   type RecordOutcomeOptions,
 } from "./breaker";
 export { PostgresAuditSink, CREATE_AUDIT_TABLE_SQL } from "./audit-pg";
+export { routeChoiceFor, ROUTE_CHOICE_TOP_N } from "./route-choice";
 export {
   PostgresCorridorHealthStore,
   CREATE_BREAKERS_TABLE_SQL,
@@ -48,37 +49,25 @@ export {
 export {
   CREATE_RATE_SAMPLES_TABLE_SQL,
   RATE_SAMPLES_INDEX_SQL,
+  CREATE_RATE_DAILY_SUMMARIES_TABLE_SQL,
+  RATE_DAILY_SUMMARIES_INDEX_SQL,
+  RATE_HISTORY_MIGRATION_SQL,
+  RATE_SAMPLE_SOURCES,
+  ANCHOR_RATE_SOURCES,
+  RATE_NETWORKS,
   PostgresRateHistoryStore,
+  assertRateSample,
+  assertRateDailySummary,
+  type RateSeries,
+  type RateNetwork,
+  type RateSampleInput,
   type RateSampleRecord,
   type RateSampleSource,
   type ListRateSamplesFilter,
+  type RateDailySummary,
+  type RateDailySummaryRecord,
+  type ListRateDailySummariesFilter,
 } from "./rate-samples-pg";
-export {
-  percentile,
-  computeP25,
-  computeMedian,
-  windowed,
-  estimateRate,
-  type EstimateRateOptions,
-} from "./rate-percentile";
-export {
-  DEX_TRADE_RESOLUTION_15M,
-  formatDexAsset,
-  resolveAssetQueryParams,
-  defaultHorizonUrl,
-  buildTradeAggregationsUrl,
-  transformTradeAggregations,
-  fetchTradeAggregations,
-  collectDexTradesForPair,
-  collectDexTrades,
-  loadDexPairsConfig,
-  type DexAssetConfig,
-  type DexPairConfig,
-  type HorizonTradeAggregationRecord,
-  type HorizonTradeAggregationsResponse,
-  type CollectDexTradesOptions,
-  type RateSampleSink,
-} from "./rate-collector-dex";
 export {
   UnimplementedSubmitter,
   createMockSubmitter,
@@ -143,6 +132,8 @@ export {
   type AuditSink,
   type AuditEntry,
   type AuditDetail,
+  type RouteChoice,
+  type RouteChoiceOption,
   type Alert,
   type AlertKind,
   type Alerting,
