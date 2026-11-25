@@ -51,6 +51,23 @@ const INTENT: PaymentIntent = {
   sourceAmount: { asset: "USDC", amount: "5.00" },
 };
 
+function deps(
+  adapter: ReturnType<typeof createMockAdapter>,
+  audit: InMemoryAuditLog,
+  submitter: ReturnType<typeof createMockSubmitter>,
+): EngineDeps {
+  return {
+    resolver: new StaticRouteResolver(() => adapter, {
+      trustManifestWithoutAttestation: true,
+    }),
+    idempotency: new InMemoryIdempotencyStore(),
+    audit,
+    submitter,
+    trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
+  };
+}
+
 describe("execute with supplied quote (#622)", () => {
   it("uses the pre-fetched quote as-is without calling adapter requestQuote", async () => {
     const adapter = createMockAdapter();
@@ -119,5 +136,95 @@ describe("execute with supplied quote (#622)", () => {
     const quotedEntry = audit.entries.find((e) => e.to === "quoted");
     expect(quotedEntry).toBeDefined();
     expect(quotedEntry?.quoteSupplied).toBeUndefined();
+  });
+  it("hands the supplied quote itself to the anchor and settles its exact amount", async () => {
+    const adapter = createMockAdapter();
+    const openSpy = vi.spyOn(adapter, "openTransaction");
+    const submitter = createMockSubmitter();
+    const submitSpy = vi.spyOn(submitter, "submit");
+    const suppliedQuote: Quote = {
+      id: "locked-as-is",
+      sourceAmount: { asset: "USDC", amount: "5.00" },
+      destAmount: { asset: "iso4217:ARS", amount: "6250.123" },
+      price: "1250.0246",
+      expiresAt: Date.now() + 100_000,
+      firm: true,
+    };
+    const res = await execute(
+      { ...INTENT, idempotencyKey: "as-is-3" },
+      corridor(),
+      deps(adapter, new InMemoryAuditLog(), submitter),
+      { quote: suppliedQuote },
+    );
+    expect(res.ok).toBe(true);
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy.mock.calls[0]![1]).toBe(suppliedQuote);
+    expect(submitSpy.mock.calls[0]![0].amount).toEqual({ asset: "USDC", amount: "5.00" });
+  });
+
+  it.each([
+    [
+      "another source asset",
+      { sourceAmount: { asset: "EURC", amount: "5.00" } },
+      /source asset EURC/,
+    ],
+    [
+      "another source amount",
+      { sourceAmount: { asset: "USDC", amount: "500" } },
+      /source amount 500/,
+    ],
+    ["no price", { price: "0" }, /no positive price/],
+    ["no expiry", { expiresAt: Number.NaN }, /no valid expiresAt/],
+  ])(
+    "refuses a supplied quote for %s without re-quoting or settling",
+    async (_name, over, msg) => {
+      const adapter = createMockAdapter();
+      const requestQuoteSpy = vi.spyOn(adapter, "requestQuote");
+      const submitter = createMockSubmitter();
+      const submitSpy = vi.spyOn(submitter, "submit");
+      const bad = {
+        id: "bad-quote",
+        sourceAmount: { asset: "USDC", amount: "5.00" },
+        destAmount: { asset: "iso4217:ARS", amount: "6250.00" },
+        price: "1250.00",
+        expiresAt: Date.now() + 100_000,
+        firm: true,
+        ...over,
+      } as Quote;
+      const res = await execute(
+        { ...INTENT, idempotencyKey: `bad-${_name}` },
+        corridor(),
+        deps(adapter, new InMemoryAuditLog(), submitter),
+        { quote: bad },
+      );
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error.code).toBe("QUOTE_UNAVAILABLE");
+        expect(res.error.retryable).toBe(false);
+        expect(res.error.message).toMatch(msg);
+      }
+      expect(requestQuoteSpy).not.toHaveBeenCalled();
+      expect(submitSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts the same amount written differently", async () => {
+    const adapter = createMockAdapter();
+    const res = await execute(
+      { ...INTENT, idempotencyKey: "same-amount-4" },
+      corridor(),
+      deps(adapter, new InMemoryAuditLog(), createMockSubmitter()),
+      {
+        quote: {
+          id: "q-5",
+          sourceAmount: { asset: "USDC", amount: "5" },
+          destAmount: { asset: "iso4217:ARS", amount: "6250" },
+          price: "1250",
+          expiresAt: Date.now() + 100_000,
+          firm: true,
+        },
+      },
+    );
+    expect(res.ok).toBe(true);
   });
 });

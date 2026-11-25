@@ -1,304 +1,290 @@
-// Collector step that reads Horizon trade aggregations for configured pairs
-// and stores them as rate samples (RFC 0004 / #591).
+// Rate history collector for Stellar DEX trade prices. RFC 0004 §3, issue #591.
 //
-// Invariants:
-// - Uses Horizon /trade_aggregations with 15-minute resolution (900000 ms).
-// - Preserves close price as exact decimal string (never float).
-// - Skips buckets with zero trades.
-// - Tags every sample with source="dex_trade".
+// The DEX gives a public price for the same pairs the anchors quote, so it is an
+// independent cross-check on anchor prices. This step reads Horizon
+// `/trade_aggregations` at a 15-minute resolution for each configured pair and
+// writes one `dex_trade` sample per bucket into the rate history store
+// (`rate-samples-pg.ts`):
+//
+// - sell asset = the pair's base, buy asset = its counter, so the stored rate is
+//   "counter units per one base unit", which is what Horizon's `close` means;
+// - the rate is Horizon's `close` string, stored verbatim (never parsed into a
+//   JS number), and the bucket's trade count and volumes go in `detail`;
+// - buckets with zero trades are skipped;
+// - a DEX price belongs to no anchor, so `anchorDomain` is always null.
+//
+// Re-reading an overlapping window is safe: the store ignores a second sample for
+// the same series and instant.
 
-import { isValidAmount } from "@corridor/types";
-import type { RateSampleRecord } from "./rate-samples-pg";
 import { readFileSync } from "node:fs";
+import {
+  RATE_NETWORKS,
+  type RateNetwork,
+  type RateSampleInput,
+  type PostgresRateHistoryStore,
+} from "./rate-samples-pg";
 
-/** Standard 15-minute resolution for Horizon trade aggregations in milliseconds. */
+/** Horizon's 15-minute resolution, in milliseconds. */
 export const DEX_TRADE_RESOLUTION_15M = 900_000;
 
-export interface DexAssetConfig {
-  code: string;
-  issuer?: string;
-  type?: "native" | "credit_alphanum4" | "credit_alphanum12";
-}
+/** Horizon's page size ceiling for `/trade_aggregations`. */
+export const HORIZON_MAX_LIMIT = 200;
 
+/** One pair to watch. Assets are SEP-38 strings: `stellar:native` or `stellar:CODE:ISSUER`. */
 export interface DexPairConfig {
-  base: DexAssetConfig;
-  counter: DexAssetConfig;
-  network?: string;
+  network: RateNetwork;
+  base: string;
+  counter: string;
 }
 
+/** One bucket as Horizon returns it. Numbers arrive as strings. */
 export interface HorizonTradeAggregationRecord {
   timestamp: string | number;
-  count: string | number;
-  opening?: string;
-  high?: string;
-  low?: string;
+  trade_count: string | number;
   close: string;
-  close_r?: { n: number; d: number };
   base_volume?: string;
   counter_volume?: string;
+  open?: string;
+  high?: string;
+  low?: string;
   avg?: string;
 }
 
 export interface HorizonTradeAggregationsResponse {
-  _embedded?: {
-    records?: HorizonTradeAggregationRecord[];
-  };
-  records?: HorizonTradeAggregationRecord[];
+  _embedded?: { records?: HorizonTradeAggregationRecord[] };
 }
 
 export interface CollectDexTradesOptions {
+  /** Overrides the network's public Horizon (e.g. a self-hosted one). */
   horizonUrl?: string;
+  /** Bucket size in ms; defaults to 15 minutes. */
   resolution?: number;
+  /** Window start, inclusive: epoch ms, Date or ISO timestamp. */
   startTime?: number | Date | string;
+  /** Window end, exclusive: epoch ms, Date or ISO timestamp. */
   endTime?: number | Date | string;
+  /** Buckets per request, 1..200; defaults to 200 (50 hours of 15-minute buckets). */
   limit?: number;
-  order?: "asc" | "desc";
   fetch?: typeof fetch;
 }
 
-export interface RateSampleSink {
-  record(sample: RateSampleRecord): Promise<void>;
-}
+/** Where samples go: the rate history store, or anything with the same `record`. */
+export type RateSampleSink = Pick<PostgresRateHistoryStore, "record">;
 
-/** Formats an asset into a canonical asset string. */
-export function formatDexAsset(asset: DexAssetConfig): string {
-  const isNative =
-    asset.type === "native" ||
-    asset.code === "native" ||
-    (!asset.issuer && asset.code.toUpperCase() === "XLM");
-  if (isNative) {
-    return "native";
-  }
-  return asset.issuer ? `${asset.code}:${asset.issuer}` : asset.code;
-}
+const HORIZON_BY_NETWORK: Record<RateNetwork, string> = {
+  testnet: "https://horizon-testnet.stellar.org",
+  public: "https://horizon.stellar.org",
+};
 
-/** Resolves Horizon asset query parameters from asset config. */
-export function resolveAssetQueryParams(
-  asset: DexAssetConfig,
-  prefix: "base" | "counter",
-): Record<string, string> {
-  const isNative =
-    asset.type === "native" ||
-    asset.code === "native" ||
-    (!asset.issuer && asset.code.toUpperCase() === "XLM");
+const STELLAR_ACCOUNT_RE = /^G[A-Z2-7]{55}$/;
+const ASSET_CODE_RE = /^[A-Za-z0-9]{1,12}$/;
+const DECIMAL_RE = /^\d+(?:\.\d+)?$/;
 
-  if (isNative) {
-    return {
-      [`${prefix}_asset_type`]: "native",
-    };
-  }
-
-  const assetType =
-    asset.type ?? (asset.code.length <= 4 ? "credit_alphanum4" : "credit_alphanum12");
-
-  const params: Record<string, string> = {
-    [`${prefix}_asset_type`]: assetType,
-    [`${prefix}_asset_code`]: asset.code,
-  };
-
-  if (asset.issuer) {
-    params[`${prefix}_asset_issuer`] = asset.issuer;
-  }
-
-  return params;
-}
-
-/** Resolves the default Horizon URL for a network name. */
-export function defaultHorizonUrl(network: string = "public"): string {
-  const n = network.toLowerCase();
-  if (n === "testnet") {
-    return "https://horizon-testnet.stellar.org";
-  }
-  return "https://horizon.stellar.org";
+/** The public Horizon for a network. */
+export function defaultHorizonUrl(network: RateNetwork): string {
+  return HORIZON_BY_NETWORK[network];
 }
 
 /**
- * Builds the Horizon /trade_aggregations URL for a configured pair and options.
+ * Horizon query parameters for one side of a pair. Throws on anything that is not
+ * `stellar:native` or `stellar:CODE:ISSUER`: a DEX pair is two on-chain assets.
  */
+export function horizonAssetParams(
+  asset: string,
+  prefix: "base" | "counter",
+): Record<string, string> {
+  if (asset === "stellar:native") return { [`${prefix}_asset_type`]: "native" };
+  const parts = asset.split(":");
+  const [scheme, code, issuer] = parts;
+  if (
+    parts.length !== 3 ||
+    scheme !== "stellar" ||
+    !code ||
+    !ASSET_CODE_RE.test(code) ||
+    !issuer ||
+    !STELLAR_ACCOUNT_RE.test(issuer)
+  ) {
+    throw new RangeError(
+      `${prefix} asset must be "stellar:native" or "stellar:CODE:ISSUER", got ${JSON.stringify(asset)}`,
+    );
+  }
+  return {
+    [`${prefix}_asset_type`]: code.length <= 4 ? "credit_alphanum4" : "credit_alphanum12",
+    [`${prefix}_asset_code`]: code,
+    [`${prefix}_asset_issuer`]: issuer,
+  };
+}
+
+function epochMs(value: number | Date | string, field: string): number {
+  const ms =
+    typeof value === "number"
+      ? value
+      : value instanceof Date
+        ? value.getTime()
+        : new Date(value).getTime();
+  if (!Number.isSafeInteger(ms) || ms < 0) {
+    throw new RangeError(`${field} must be a valid time`);
+  }
+  return ms;
+}
+
+/** Rejects a pair that Horizon or the store would refuse. */
+export function assertDexPair(pair: DexPairConfig): void {
+  if (!(RATE_NETWORKS as readonly string[]).includes(pair.network)) {
+    throw new RangeError(`network must be one of ${RATE_NETWORKS.join(", ")}`);
+  }
+  horizonAssetParams(pair.base, "base");
+  horizonAssetParams(pair.counter, "counter");
+  if (pair.base === pair.counter) {
+    throw new RangeError(`base and counter are the same asset (${pair.base})`);
+  }
+}
+
+/** The `/trade_aggregations` URL for one pair. */
 export function buildTradeAggregationsUrl(
   pair: DexPairConfig,
   options: CollectDexTradesOptions = {},
 ): string {
-  const network = pair.network ?? "public";
-  const baseUrl = (options.horizonUrl ?? defaultHorizonUrl(network)).replace(/\/+$/, "");
-  const url = new URL(`${baseUrl}/trade_aggregations`);
-
-  const baseParams = resolveAssetQueryParams(pair.base, "base");
-  for (const [k, v] of Object.entries(baseParams)) {
+  assertDexPair(pair);
+  const base = (options.horizonUrl ?? defaultHorizonUrl(pair.network)).replace(/\/+$/, "");
+  const url = new URL(`${base}/trade_aggregations`);
+  for (const [k, v] of Object.entries({
+    ...horizonAssetParams(pair.base, "base"),
+    ...horizonAssetParams(pair.counter, "counter"),
+  })) {
     url.searchParams.set(k, v);
   }
-
-  const counterParams = resolveAssetQueryParams(pair.counter, "counter");
-  for (const [k, v] of Object.entries(counterParams)) {
-    url.searchParams.set(k, v);
-  }
-
-  const resolution = options.resolution ?? DEX_TRADE_RESOLUTION_15M;
-  url.searchParams.set("resolution", resolution.toString());
-
+  url.searchParams.set("resolution", String(options.resolution ?? DEX_TRADE_RESOLUTION_15M));
   if (options.startTime !== undefined) {
-    const startMs =
-      options.startTime instanceof Date
-        ? options.startTime.getTime()
-        : typeof options.startTime === "string"
-          ? new Date(options.startTime).getTime()
-          : options.startTime;
-    url.searchParams.set("start_time", startMs.toString());
+    url.searchParams.set("start_time", String(epochMs(options.startTime, "startTime")));
   }
-
   if (options.endTime !== undefined) {
-    const endMs =
-      options.endTime instanceof Date
-        ? options.endTime.getTime()
-        : typeof options.endTime === "string"
-          ? new Date(options.endTime).getTime()
-          : options.endTime;
-    url.searchParams.set("end_time", endMs.toString());
+    url.searchParams.set("end_time", String(epochMs(options.endTime, "endTime")));
   }
-
-  if (options.limit !== undefined) {
-    url.searchParams.set("limit", options.limit.toString());
+  const limit = options.limit ?? HORIZON_MAX_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > HORIZON_MAX_LIMIT) {
+    throw new RangeError(`limit must be an integer from 1 to ${HORIZON_MAX_LIMIT}`);
   }
-
-  if (options.order) {
-    url.searchParams.set("order", options.order);
-  }
-
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("order", "asc");
   return url.toString();
 }
 
 /**
- * Transforms raw Horizon trade aggregation records into RateSampleRecords.
- *
- * Rules:
- * - Drops buckets where trade count is 0.
- * - Extracts close price verbatim without float conversion.
- * - Tags source as "dex_trade".
- * - Stores tradeCount and volume in detail.
+ * Turns Horizon buckets into `dex_trade` samples for the store. Buckets with zero
+ * trades, and any with a malformed count, timestamp or close, are skipped.
  */
-export function transformTradeAggregations(
+export function tradeAggregationsToSamples(
   records: readonly HorizonTradeAggregationRecord[],
   pair: DexPairConfig,
-  networkOverride?: string,
-): RateSampleRecord[] {
-  const network = networkOverride ?? pair.network ?? "public";
-  const sellAsset = formatDexAsset(pair.base);
-  const buyAsset = formatDexAsset(pair.counter);
-  const pairKey = `${sellAsset}:${buyAsset}`;
-
-  const samples: RateSampleRecord[] = [];
-
+  resolution: number = DEX_TRADE_RESOLUTION_15M,
+): RateSampleInput[] {
+  const samples: RateSampleInput[] = [];
   for (const record of records) {
-    const tradeCount =
-      typeof record.count === "number" ? record.count : parseInt(record.count, 10);
-
-    // Skip buckets with zero trades
-    if (Number.isNaN(tradeCount) || tradeCount <= 0) {
-      continue;
-    }
-
-    const rate = record.close;
-    if (!rate || !isValidAmount(rate)) {
-      continue;
-    }
-
-    const timestampMs =
-      typeof record.timestamp === "number" ? record.timestamp : parseInt(record.timestamp, 10);
-
+    const tradeCount = Number(record.trade_count);
+    if (!Number.isSafeInteger(tradeCount) || tradeCount <= 0) continue;
+    const sampledAt = Number(record.timestamp);
+    if (!Number.isSafeInteger(sampledAt) || sampledAt < 0) continue;
+    const rate = typeof record.close === "string" ? record.close.trim() : "";
+    // The store needs a positive rate; a zero close carries no price.
+    if (!DECIMAL_RE.test(rate) || !/[1-9]/.test(rate)) continue;
     samples.push({
-      pair: pairKey,
-      sellAsset,
-      buyAsset,
+      network: pair.network,
+      sellAsset: pair.base,
+      buyAsset: pair.counter,
       source: "dex_trade",
+      anchorDomain: null,
       rate,
-      sampledAt: timestampMs,
-      network,
+      sampledAt,
       detail: {
         tradeCount,
-        baseVolume: record.base_volume ?? null,
-        counterVolume: record.counter_volume ?? null,
-        open: record.opening ?? null,
-        high: record.high ?? null,
-        low: record.low ?? null,
-        avg: record.avg ?? null,
+        resolutionMs: resolution,
+        ...(record.base_volume !== undefined && { baseVolume: record.base_volume }),
+        ...(record.counter_volume !== undefined && { counterVolume: record.counter_volume }),
       },
     });
   }
-
   return samples;
 }
 
-/**
- * Fetches trade aggregations from Horizon for a given pair.
- */
+/** Reads one page of buckets for a pair from Horizon. */
 export async function fetchTradeAggregations(
   pair: DexPairConfig,
   options: CollectDexTradesOptions = {},
 ): Promise<HorizonTradeAggregationRecord[]> {
-  const fetchImpl = options.fetch ?? fetch;
   const url = buildTradeAggregationsUrl(pair, options);
-
-  const res = await fetchImpl(url);
+  const res = await (options.fetch ?? fetch)(url, { headers: { accept: "application/json" } });
   if (!res.ok) {
-    throw new Error(
-      `failed to fetch Horizon trade aggregations from ${url}: HTTP ${res.status} ${res.statusText}`,
-    );
+    throw new Error(`Horizon trade_aggregations failed: HTTP ${res.status} for ${url}`);
   }
-
-  const json = (await res.json()) as HorizonTradeAggregationsResponse;
-  const records = json._embedded?.records ?? json.records ?? [];
+  const body = (await res.json()) as HorizonTradeAggregationsResponse;
+  const records = body?._embedded?.records;
+  if (!Array.isArray(records)) {
+    throw new Error(`Horizon trade_aggregations returned no records array for ${url}`);
+  }
   return records;
 }
 
-/**
- * Collects DEX trade samples for a single pair and optionally stores them in a RateSampleSink.
- */
+export interface DexPairResult {
+  pair: DexPairConfig;
+  samples: RateSampleInput[];
+  /** How many samples were new to the store (0 without a sink). */
+  inserted: number;
+}
+
+/** Collects one pair and, given a sink, stores its samples. */
 export async function collectDexTradesForPair(
   pair: DexPairConfig,
-  store?: RateSampleSink,
+  sink?: RateSampleSink,
   options: CollectDexTradesOptions = {},
-): Promise<RateSampleRecord[]> {
+): Promise<DexPairResult> {
   const records = await fetchTradeAggregations(pair, options);
-  const samples = transformTradeAggregations(
+  const samples = tradeAggregationsToSamples(
     records,
     pair,
-    options.horizonUrl ? undefined : pair.network,
+    options.resolution ?? DEX_TRADE_RESOLUTION_15M,
   );
-
-  if (store) {
+  let inserted = 0;
+  if (sink) {
     for (const sample of samples) {
-      await store.record(sample);
+      if (await sink.record(sample)) inserted++;
     }
   }
-
-  return samples;
+  return { pair, samples, inserted };
 }
 
-/**
- * Collects DEX trade samples for multiple configured pairs.
- */
+/** Collects every pair in turn. One pair failing stops the run, so nothing is silently skipped. */
 export async function collectDexTrades(
   pairs: readonly DexPairConfig[],
-  store?: RateSampleSink,
+  sink?: RateSampleSink,
   options: CollectDexTradesOptions = {},
-): Promise<RateSampleRecord[]> {
-  const allSamples: RateSampleRecord[] = [];
+): Promise<DexPairResult[]> {
+  const results: DexPairResult[] = [];
   for (const pair of pairs) {
-    const samples = await collectDexTradesForPair(pair, store, options);
-    allSamples.push(...samples);
+    results.push(await collectDexTradesForPair(pair, sink, options));
   }
-  return allSamples;
+  return results;
 }
 
-/**
- * Loads DEX pair configurations from a JSON file path or returns array directly.
- */
-export function loadDexPairsConfig(
-  configPathOrPairs: string | readonly DexPairConfig[],
-): DexPairConfig[] {
-  if (typeof configPathOrPairs !== "string") {
-    return [...configPathOrPairs];
-  }
-  const content = readFileSync(configPathOrPairs, "utf-8");
-  return JSON.parse(content) as DexPairConfig[];
+/** Parses and checks a pairs config: a JSON array of `{ network, base, counter }`. */
+export function parseDexPairsConfig(raw: unknown): DexPairConfig[] {
+  if (!Array.isArray(raw)) throw new RangeError("DEX pairs config must be a JSON array");
+  return raw.map((entry, i) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new RangeError(`DEX pair ${i} must be an object`);
+    }
+    const { network, base, counter } = entry as Record<string, unknown>;
+    const pair = { network, base, counter } as DexPairConfig;
+    try {
+      assertDexPair(pair);
+    } catch (e) {
+      throw new RangeError(`DEX pair ${i}: ${(e as Error).message}`, { cause: e });
+    }
+    return pair;
+  });
+}
+
+/** Reads `config/dex-pairs.json` (or another path) and checks every pair. */
+export function loadDexPairsConfig(path: string): DexPairConfig[] {
+  return parseDexPairsConfig(JSON.parse(readFileSync(path, "utf8")));
 }

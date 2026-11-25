@@ -1072,51 +1072,72 @@ the anchor's own status page). Clearing a halt on an unfixed anchor just
 re-spends the fee that proved the lane was down. The reset is recorded, so a
 later `tripped` right after a `reset` is a fast signal that the reopen was wrong.
 
-## 8. Registry & attester contract upgrades
+## 8. Registry and attester upgrades
 
-The on-chain anchor conformance registry (`contracts/registry`) stores observed facts about anchor capabilities. As new protocols and conformance probes are added (e.g. `sep6_info`, `sep6_auth`), `PROBE_NAMES` grows. Because probe bits are strictly appended, new bits expand the allowed `PROBE_MASK`.
+The registry (`contracts/registry`) validates every write against the SEP and probe bits it was
+compiled with (`SEP_NUMBERS`, `PROBE_NAMES`), and the attester (`contracts/attester`) relays
+writes to it. Both grow over time: bits are only ever appended and functions only added, so an
+upgrade never invalidates a stored record (see the migration notes at the top of
+`contracts/registry/src/lib.rs` and `docs/registry-metadata.md`). A deployed contract that is
+older than `main` shows up in one of two ways:
 
-If an attestation job submits probe results with newer bits to an older deployed registry, the contract rejects the write with `Error::UnknownBit` (contract error `#4`, surfaced via the attester as `invalid domain (contract error #4)`).
+- `UnknownBit` (registry contract error `#4`) for every anchor that sets a newer bit. Those are
+  the anchors with the richest probe results, so the registry goes half fresh, half frozen.
+- `Error(WasmVm, MissingValue)` when a client calls a function the deployed wasm does not export.
+  `pnpm attest` skips the receive limits in that case (#773) and writes the rest.
 
-### Preflight check
-
-The nightly attestation workflow runs a preflight check before submitting per-anchor attestations:
+### Preflight
 
 ```bash
-pnpm preflight:registry
-# or for custom network:
-STELLAR_NETWORK=testnet pnpm preflight:registry
+pnpm preflight:registry                      # testnet
+STELLAR_NETWORK=public pnpm preflight:registry
 ```
 
-The preflight verifies that the deployed contract supports all current `PROBE_NAMES` and query methods (`serves_sep6`, `get_meta`, `receives_asset`). If the contract is behind, it fails with an actionable message:
+Read-only, needs no key. It reads each deployed contract's wasm (and prints its sha256), checks
+the contract spec for every function the clients call (`REGISTRY_FUNCTIONS`,
+`ATTESTER_FUNCTIONS` in `packages/registry/src/preflight.ts`), and simulates `put_anchor` with
+every current SEP and probe bit set. It prints one line and exits 1 when anything is behind:
 
 ```
-✗ deployed registry contract on testnet is behind main: upgrade() the registry to current PROBE_NAMES before running attestation (run pnpm upgrade:registry)
+✗ deployed contracts on testnet are behind main: missing functions registry.put_receive,
+  registry.get_receive, registry.receive_limits, attester.attest_receive. Attestations still run
+  without the receive limits. An admin must upgrade: ...
 ```
 
-### Upgrading the registry contract
+The nightly `attest-anchors` workflow runs it before `pnpm attest`:
 
-The registry contract provides an admin-only `upgrade(new_wasm_hash)` entrypoint that updates the contract executable in place while preserving all existing anchor records and metadata in storage.
+| Preflight finds                                       | Submit step | Run   |
+| ----------------------------------------------------- | ----------- | ----- |
+| nothing behind                                        | runs        | green |
+| only the receive functions (`NON_BLOCKING_FUNCTIONS`) | runs        | red   |
+| a rejected bit or any other missing function          | skipped     | red   |
+| an answer it cannot interpret (RPC down, ...)         | skipped     | red   |
 
-1. **Simulate the upgrade (default):**
+### Upgrading
+
+`upgrade()` is admin-only on both contracts, so a maintainer holding the admin key runs the
+final step. Upgrade the registry first and the attester second, so an attester never relays to
+a function the registry does not have yet.
+
+1. Dry run. Builds the wasm with the Stellar CLI, prints the deployed and built hashes, and
+   simulates the upload and the `upgrade` call. Nothing is sent and no key is needed.
 
    ```bash
    pnpm upgrade:registry
+   pnpm upgrade:registry --contract attester
    ```
 
-   This builds the `corridor-registry` wasm, computes its SHA-256 hash, and simulates both bytecode upload and `registry.upgrade()`. No transaction is broadcast.
-
-2. **Submit the upgrade:**
-   An authorized maintainer with `REGISTRY_ADMIN_SECRET` runs:
+2. Submit, with the admin's secret in the environment. The script refuses a key that is not
+   the contract's `admin()`, and never takes the secret as an argument or prints it.
 
    ```bash
    REGISTRY_ADMIN_SECRET=S... pnpm upgrade:registry --submit
+   REGISTRY_ADMIN_SECRET=S... pnpm upgrade:registry --contract attester --submit
    ```
 
-   This broadcasts the wasm upload, waits for ledger confirmation, and calls `upgrade(new_wasm_hash)`.
+3. Append the entry the script prints to `upgrades` in `contracts/deployments.json`, and run
+   `pnpm preflight:registry` again: it should pass.
 
-3. **Mainnet safeguards:**
-   The upgrade script refuses to touch `public`/`mainnet` without the explicit `--allow-mainnet` flag:
-   ```bash
-   pnpm upgrade:registry --network public --allow-mainnet --submit
-   ```
+The network defaults to testnet. The public network is refused unless asked for twice:
+`--network public --allow-mainnet`. Use `--wasm <path>` to upgrade to a wasm built elsewhere
+(for example a reproducible CI build) instead of building one.

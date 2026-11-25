@@ -745,9 +745,14 @@ function nativeToScValString(s: string): xdr.ScVal {
 }
 
 export {
+  ATTESTER_FUNCTIONS,
+  NON_BLOCKING_FUNCTIONS,
+  REGISTRY_FUNCTIONS,
   preflightRegistry,
   loadDeployments,
+  type DeploymentEntry,
+  type DeploymentsConfig,
   type PreflightOptions,
   type PreflightResult,
-  type DeploymentsConfig,
+  type PreflightServer,
 } from "./preflight";
